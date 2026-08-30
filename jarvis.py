@@ -21,25 +21,26 @@ Tuning (constants below):
   FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP — if True, launch Cursor without -n (reuse / focus existing instance).
   OPEN_NEW_CURSOR_ON_DOUBLE_CLAP — if True, also launch Cursor with -n (extra new window; runs after focus launch if both).
   CURSOR_OPEN_FULLSCREEN — Windows: after focus/launch, send F11 to enter Cursor/VS Code-style fullscreen (toggle off with F11).
-  OPEN_CLAUDE_CODE_IN_CHROME — Claude in Chrome after Spotify (CLAUDE_CODE_URL).
+  OPEN_CRM_IN_CHROME — Centro de Comando Jarvis (Artifact) in Chrome after Spotify (CRM_URL).
   OPEN_BINANCE_BTC_IN_CHROME — Binance BTC trade page in Chrome (BINANCE_BTC_URL).
-  CLAUDE_CHROME_MONITOR / BINANCE_CHROME_MONITOR — 1-based display index (Windows: sorted left-to-top).
+  CRM_CHROME_MONITOR / BINANCE_CHROME_MONITOR — 1-based display index (Windows: sorted left-to-top).
   CHROME_SEPARATE_SITE_PROFILES — Windows: if True, uses temp --user-data-dir per site (not your normal profile).
-    Default False so Claude/Binance use your usual Chrome profile and logins; enable only if both windows keep
-    opening on the same monitor and you accept a separate profile for automation.
+    Default False so the CRM/Binance windows use your usual Chrome profile and logins; enable only if both windows
+    keep opening on the same monitor and you accept a separate profile for automation.
   OPEN_CHROME_FULLSCREEN — Fullscreen on the chosen monitor (Windows: new window is detected and snapped with SetWindowPos).
-  JARVIS_WELCOME_* — TTS after the song (ElevenLabs). Configure via environment or a `.env`
-    file next to this script (ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, etc.).
-    With JARVIS_WELCOME_CACHE_ENABLED, audio is saved under `.cache/jarvis_welcome/` (WAV) and
-    replayed when phrase + voice + model + format match—no repeat API call. Delete that folder
-    or set JARVIS_WELCOME_CACHE_ENABLED=False to force a fresh fetch.
+  JARVIS_WELCOME_* — TTS after the song, spoken with the Windows native SAPI voice
+    (System.Speech), no external API or account needed.
   The welcome sequence runs only once per process. The assistant speaks in the background so Cursor
     opens without waiting for playback to finish (restart the script to run again).
+  WAKE_WORD_* — offline "Ei Jarvis" / "Ei sistema" detection via Vosk (models/vosk-model-small-pt-0.3, no
+    account/internet needed at runtime). Shares the same mic stream as clap detection. Runs the
+    welcome sequence without opening Cursor (unlike clap/hotkey, which do).
 """
 
 from __future__ import annotations
 
-import hashlib
+import base64
+import json
 import logging
 import os
 import shutil
@@ -48,7 +49,7 @@ import sys
 import tempfile
 import threading
 import time
-import wave
+import unicodedata
 import webbrowser
 from pathlib import Path
 
@@ -77,37 +78,60 @@ INPUT_SILENT_RMS = 0.001
 # YouTube: https://www.youtube.com/watch?v=...
 SONG_URI = "https://open.spotify.com/track/39shmbIHICJ2Wxnk1fPSdz?si=2900c75c2e2d4b82"
 
+# Global hotkey (Windows): press anytime to trigger the welcome sequence, mic-independent.
+# Works alongside the double-clap listener; useful when the microphone is unreliable.
+HOTKEY_ENABLED = True
+HOTKEY_MODIFIERS = 0x0002 | 0x0001  # MOD_CONTROL | MOD_ALT
+HOTKEY_VK = 0x4A  # 'J' -> Ctrl+Alt+J
+
+# Wake word (offline, via Vosk — shares the mic stream used for clap detection). Triggers the
+# welcome sequence WITHOUT opening Cursor (see run_double_clap_actions).
+# The small pt-BR model has no "jarvis" in its vocabulary at all (confirmed: even
+# grammar-constrained decoding drops the word). Empirically, saying "Jarvis" (with or without
+# "Ei" in front) is consistently misheard by this model as "arvores" — tested across 3 phonetic
+# variants with the pt-BR TTS voice, always identical. So "Ei Jarvis" works in practice via that
+# consistent mishearing; "sistema" is kept as a reliable, intentional real-word fallback.
+# Trade-off: "arvores"/"sistema" are ordinary words, so this is more prone to accidental
+# triggers than a true distinctive wake word — WAKE_WORD_COOLDOWN_S limits how often that costs
+# anything. If your own voice gets misheard as something else, check the DEBUG log (any
+# recognized phrase is logged) and add it to WAKE_WORD_TRIGGERS.
+# Model lives under %LOCALAPPDATA% (not the project folder): Vosk's C++ loader chokes on
+# accented characters in absolute Windows paths, and this project folder has "Área" in it.
+WAKE_WORD_ENABLED = True
+WAKE_WORD_MODEL_DIR = Path(os.environ.get("LOCALAPPDATA", "")) / "JarvisWakeWord" / "vosk-model-small-pt-0.3"
+WAKE_WORD_SAMPLE_RATE = 16000
+WAKE_WORD_TRIGGERS = ("arvores", "sistema")
+WAKE_WORD_COOLDOWN_S = 4.0
+
 # Cursor: focus existing instance (no -n). Set OPEN_NEW_CURSOR_ON_DOUBLE_CLAP for a new window as well.
 FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP = True
 OPEN_NEW_CURSOR_ON_DOUBLE_CLAP = False
 CURSOR_OPEN_FULLSCREEN = True
 
-# Google Chrome (fallback: default browser). URLs overridable in .env.
-OPEN_CLAUDE_CODE_IN_CHROME = True
-OPEN_BINANCE_BTC_IN_CHROME = True
+# Google Chrome (fallback: default browser). URL overridable in .env (CRM_URL).
+CRM_URL_DEFAULT = "https://claude.ai/code/artifact/ab6edc26-de76-4042-b0c2-efcad443908e"
+OPEN_CRM_IN_CHROME = True
+OPEN_BINANCE_BTC_IN_CHROME = False
 OPEN_CHROME_FULLSCREEN = True
 # False = default Chrome profile (your normal user, extensions, cookies). True = temp dirs under %TEMP% per site.
 CHROME_SEPARATE_SITE_PROFILES = False
 # Which physical screen (1 = leftmost/top-first after sorting). Windows only; ignored elsewhere.
-CLAUDE_CHROME_MONITOR = 1
+CRM_CHROME_MONITOR = 1
 BINANCE_CHROME_MONITOR = 3
 
 JARVIS_WELCOME_ENABLED = True
 JARVIS_WELCOME_PHRASE = (
-    "Welcome home sir. "
-    "Congratulations on the new client for your SaaS app—make sure to follow up. "
-    "If it helps: a short, specific note while the deal is still fresh usually "
-    "anchors trust better than a polished deck sent cold a few days later."
+    "Bem-vindo de volta. "
+    "Ambiente de trabalho pronto: Spotify, Chrome e Cursor no ar. "
+    "Bom trabalho pela frente."
 )
 # Seconds after launching SONG_URI before speaking (gives Spotify/browser time to start).
 JARVIS_AFTER_SONG_DELAY_S = 1.0
-# Save ElevenLabs PCM as WAV under .cache/jarvis_welcome/; replay skips the API when the key matches.
-JARVIS_WELCOME_CACHE_ENABLED = True
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=(os.environ.get("JARVIS_LOG_LEVEL") or "INFO").upper(),
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -246,138 +270,30 @@ def _choose_input_device(blocksize: int) -> int:
     return idx
 
 
-def _elevenlabs_pcm_sample_rate(output_format: str) -> int:
-    override = (os.environ.get("ELEVENLABS_PCM_SAMPLE_RATE") or "").strip()
-    if override.isdigit():
-        return int(override)
-    if output_format.startswith("pcm_"):
-        try:
-            return int(output_format.split("_", maxsplit=1)[1])
-        except (ValueError, IndexError):
-            pass
-    return 24000
-
-
-def elevenlabs_env_config() -> tuple[str, str, str, int]:
-    """voice_id, model_id, output_format, pcm_sample_rate."""
-    voice = (os.environ.get("ELEVENLABS_VOICE_ID") or "").strip()
-    model = (os.environ.get("ELEVENLABS_MODEL_ID") or "eleven_multilingual_v2").strip()
-    fmt = (os.environ.get("ELEVENLABS_OUTPUT_FORMAT") or "pcm_24000").strip()
-    rate = _elevenlabs_pcm_sample_rate(fmt)
-    return voice, model, fmt, rate
-
-
-def _jarvis_welcome_cache_dir() -> Path:
-    base = Path(__file__).resolve().parent
-    override = (os.environ.get("JARVIS_WELCOME_CACHE_DIR") or "").strip()
-    if override:
-        return Path(override).expanduser().resolve()
-    return base / ".cache" / "jarvis_welcome"
-
-
-def _jarvis_welcome_cache_path(
-    text: str, voice_id: str, model_id: str, output_format: str
-) -> Path:
-    key = f"{text}|{voice_id}|{model_id}|{output_format}".encode()
-    digest = hashlib.sha256(key).hexdigest()[:24]
-    return _jarvis_welcome_cache_dir() / f"{digest}.wav"
-
-
-def _play_pcm_wav_file(path: Path) -> bool:
-    try:
-        with wave.open(str(path), "rb") as wf:
-            ch = wf.getnchannels()
-            sw = wf.getsampwidth()
-            rate = wf.getframerate()
-            if ch != 1 or sw != 2:
-                log.warning("Unsupported cached WAV (channels=%s, width=%s).", ch, sw)
-                return False
-            raw = wf.readframes(wf.getnframes())
-    except (OSError, wave.Error) as e:
-        log.warning("Could not read cached welcome audio: %s", e)
-        return False
-    if not raw:
-        return False
-    pcm_i16 = np.frombuffer(raw, dtype=np.int16)
-    pcm_f = pcm_i16.astype(np.float32) / 32768.0
-    try:
-        sd.play(pcm_f, rate)
-        sd.wait()
-    except Exception as e:
-        log.warning("Could not play cached welcome audio: %s", e)
-        return False
-    return True
-
-
-def _save_pcm_wav_file(path: Path, pcm_bytes: bytes, sample_rate: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        with wave.open(str(tmp), "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(sample_rate)
-            wf.writeframes(pcm_bytes)
-        tmp.replace(path)
-    except OSError:
-        if tmp.is_file():
-            tmp.unlink(missing_ok=True)
-        raise
-
-
 def say_jarvis_welcome() -> None:
+    """Speak JARVIS_WELCOME_PHRASE using the Windows native SAPI voice (no ElevenLabs)."""
     if not JARVIS_WELCOME_ENABLED or not JARVIS_WELCOME_PHRASE.strip():
         return
     text = JARVIS_WELCOME_PHRASE.strip()
-    vid, model_id, output_format, pcm_rate = elevenlabs_env_config()
-    if not vid:
-        log.warning("Set ELEVENLABS_VOICE_ID in the environment for ElevenLabs TTS.")
+    if sys.platform != "win32":
+        log.warning("Native TTS is only implemented for Windows.")
         return
-
-    cache_path = _jarvis_welcome_cache_path(text, vid, model_id, output_format)
-    if JARVIS_WELCOME_CACHE_ENABLED and cache_path.is_file():
-        log.info("Playing welcome from cache: %s", cache_path)
-        if _play_pcm_wav_file(cache_path):
-            return
-        log.warning("Cache miss after read failure; fetching from ElevenLabs.")
-
-    api_key = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
-    if not api_key:
-        log.warning("Set ELEVENLABS_API_KEY in the environment for ElevenLabs TTS.")
-        return
+    b64 = base64.b64encode(text.encode("utf-16-le")).decode("ascii")
+    ps_cmd = (
+        "Add-Type -AssemblyName System.Speech; "
+        f"$t = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{b64}')); "
+        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+        "$s.Speak($t)"
+    )
     try:
-        from elevenlabs.client import ElevenLabs
-    except ImportError:
-        log.warning("Install dependencies: pip install -r requirements.txt")
-        return
-    try:
-        client = ElevenLabs(api_key=api_key)
-        chunks = client.text_to_speech.convert(
-            voice_id=vid,
-            text=text,
-            model_id=model_id,
-            output_format=output_format,
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
-        raw = b"".join(chunks)
-    except Exception as e:
-        log.warning("ElevenLabs TTS failed: %s", e)
-        return
-    if not raw:
-        log.warning("ElevenLabs returned empty audio.")
-        return
-    if JARVIS_WELCOME_CACHE_ENABLED:
-        try:
-            _save_pcm_wav_file(cache_path, raw, pcm_rate)
-            log.info("Saved welcome audio to cache: %s", cache_path)
-        except OSError as e:
-            log.warning("Could not save welcome cache: %s", e)
-    pcm_i16 = np.frombuffer(raw, dtype=np.int16)
-    pcm_f = pcm_i16.astype(np.float32) / 32768.0
-    try:
-        sd.play(pcm_f, pcm_rate)
-        sd.wait()
-    except Exception as e:
-        log.warning("Could not play ElevenLabs audio: %s", e)
+    except OSError as e:
+        log.warning("Could not speak welcome line: %s", e)
 
 
 def play_song(uri: str) -> None:
@@ -684,24 +600,24 @@ def _open_url_in_chrome(
         log.warning("Could not open %s in Chrome: %s", label, e)
 
 
-def open_claude_in_chrome() -> None:
-    if not OPEN_CLAUDE_CODE_IN_CHROME:
+def open_crm_in_chrome() -> None:
+    if not OPEN_CRM_IN_CHROME:
         return
-    url = (os.environ.get("CLAUDE_CODE_URL") or "https://claude.ai/new").strip()
+    url = (os.environ.get("CRM_URL") or CRM_URL_DEFAULT).strip()
     pos: tuple[int, int] | None = None
     size: tuple[int, int] | None = None
     fs = OPEN_CHROME_FULLSCREEN
     post_mon: int | None = None
     user_data: str | None = None
     if sys.platform == "win32":
-        post_mon = CLAUDE_CHROME_MONITOR
-        pos = _chrome_monitor_top_left(CLAUDE_CHROME_MONITOR)
+        post_mon = CRM_CHROME_MONITOR
+        pos = _chrome_monitor_top_left(CRM_CHROME_MONITOR)
         if fs:
-            size = _chrome_monitor_pixel_size(CLAUDE_CHROME_MONITOR)
+            size = _chrome_monitor_pixel_size(CRM_CHROME_MONITOR)
         else:
             size = _chrome_window_size()
         if CHROME_SEPARATE_SITE_PROFILES:
-            user_data = _chrome_site_user_data_dir("claude")
+            user_data = _chrome_site_user_data_dir("crm")
     elif not fs:
         size = _chrome_window_size()
     else:
@@ -709,7 +625,7 @@ def open_claude_in_chrome() -> None:
     _open_url_in_chrome(
         url,
         new_window=True,
-        label="Claude",
+        label="Centro de Comando Jarvis",
         window_position=pos,
         window_size=size,
         fullscreen=fs,
@@ -862,17 +778,97 @@ def _focus_existing_cursor_window_win32() -> bool:
     return True
 
 
-def run_double_clap_actions() -> None:
+def _normalize_text(s: str) -> str:
+    nfkd = unicodedata.normalize("NFKD", s)
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).lower()
+
+
+def _resample_int16(samples: np.ndarray, orig_rate: int, target_rate: int) -> np.ndarray:
+    if orig_rate == target_rate or len(samples) == 0:
+        return samples
+    duration = len(samples) / orig_rate
+    n_target = max(1, int(duration * target_rate))
+    x_orig = np.linspace(0, duration, num=len(samples), endpoint=False)
+    x_target = np.linspace(0, duration, num=n_target, endpoint=False)
+    resampled = np.interp(x_target, x_orig, samples.astype(np.float32))
+    return resampled.astype(np.int16)
+
+
+class WakeWordDetector:
+    """Feeds mic blocks to an offline Vosk recognizer; returns normalized text on each finalized utterance."""
+
+    def __init__(self, model_dir: Path, input_rate: int, target_rate: int = WAKE_WORD_SAMPLE_RATE):
+        from vosk import KaldiRecognizer, Model, SetLogLevel
+
+        SetLogLevel(-1)
+        self._model = Model(str(model_dir))
+        self._recognizer = KaldiRecognizer(self._model, target_rate)
+        self._recognizer.SetWords(False)
+        self.input_rate = input_rate
+        self.target_rate = target_rate
+
+    def feed(self, block_f32: np.ndarray) -> str | None:
+        mono = block_f32.reshape(-1)
+        pcm16 = np.clip(mono * 32767.0, -32768, 32767).astype(np.int16)
+        pcm16 = _resample_int16(pcm16, self.input_rate, self.target_rate)
+        if self._recognizer.AcceptWaveform(pcm16.tobytes()):
+            result = json.loads(self._recognizer.Result())
+            text = _normalize_text(result.get("text", ""))
+            if text:
+                return text
+        return None
+
+
+def _load_wake_word_detector(input_rate: int) -> WakeWordDetector | None:
+    if not WAKE_WORD_ENABLED:
+        return None
+    if not WAKE_WORD_MODEL_DIR.is_dir():
+        log.warning("Wake word model not found at %s — 'Ei Jarvis'/'Ei sistema' disabled.", WAKE_WORD_MODEL_DIR)
+        return None
+    try:
+        return WakeWordDetector(WAKE_WORD_MODEL_DIR, input_rate)
+    except Exception as e:
+        log.warning("Could not load wake word model: %s — 'Ei Jarvis'/'Ei sistema' disabled.", e)
+        return None
+
+
+def _hotkey_listener_win32() -> None:
+    """Blocks on a Windows message loop; runs the welcome sequence on each hotkey press."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    WM_HOTKEY = 0x0312
+    MOD_NOREPEAT = 0x4000
+    hotkey_id = 1
+
+    if not user32.RegisterHotKey(None, hotkey_id, HOTKEY_MODIFIERS | MOD_NOREPEAT, HOTKEY_VK):
+        log.warning(
+            "Could not register global hotkey (maybe already used by another app)."
+        )
+        return
+    try:
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            if msg.message == WM_HOTKEY:
+                log.info("Hotkey pressed — running welcome sequence.")
+                threading.Thread(target=run_double_clap_actions, daemon=True).start()
+    finally:
+        user32.UnregisterHotKey(None, hotkey_id)
+
+
+def run_double_clap_actions(include_cursor: bool = True) -> None:
     """Run outside the mic loop so sleeps do not stall capture."""
     play_song(SONG_URI)
-    open_claude_in_chrome()
+    open_crm_in_chrome()
     open_binance_btc_in_chrome()
     if JARVIS_WELCOME_ENABLED and JARVIS_WELCOME_PHRASE.strip():
         delay = max(0.0, JARVIS_AFTER_SONG_DELAY_S)
         if delay:
             time.sleep(delay)
         threading.Thread(target=say_jarvis_welcome, daemon=True).start()
-    open_cursor_window()
+    if include_cursor:
+        open_cursor_window()
 
 
 def open_cursor_window() -> None:
@@ -943,12 +939,12 @@ def main() -> int:
         log.info("Double clap will also open a new Cursor window (-n).")
     if CURSOR_OPEN_FULLSCREEN and sys.platform == "win32":
         log.info("Cursor will be sent F11 for fullscreen after focus/launch.")
-    if OPEN_CLAUDE_CODE_IN_CHROME:
-        cu = (os.environ.get("CLAUDE_CODE_URL") or "https://claude.ai/new").strip()
+    if OPEN_CRM_IN_CHROME:
+        cu = (os.environ.get("CRM_URL") or CRM_URL_DEFAULT).strip()
         log.info(
-            "After Spotify, open Claude in Chrome%s on monitor %d: %s",
+            "After Spotify, open CRM panel in Chrome%s on monitor %d: %s",
             " fullscreen" if OPEN_CHROME_FULLSCREEN else "",
-            CLAUDE_CHROME_MONITOR,
+            CRM_CHROME_MONITOR,
             cu,
         )
     if OPEN_BINANCE_BTC_IN_CHROME:
@@ -963,18 +959,22 @@ def main() -> int:
             bu,
         )
     if JARVIS_WELCOME_ENABLED:
-        ev, em, ef, er = elevenlabs_env_config()
         log.info(
-            "After song + %.2fs: %r (ElevenLabs voice=%s, model=%s, format=%s, pcm_rate=%d)",
+            "After song + %.2fs, will speak (Windows native voice): %r",
             JARVIS_AFTER_SONG_DELAY_S,
             JARVIS_WELCOME_PHRASE.strip(),
-            ev or "(unset)",
-            em,
-            ef,
-            er,
         )
 
+    if HOTKEY_ENABLED and sys.platform == "win32":
+        log.info("Press Ctrl+Alt+J anytime to trigger the welcome sequence (mic-independent).")
+        threading.Thread(target=_hotkey_listener_win32, daemon=True).start()
+
     input_idx = _choose_input_device(blocksize)
+
+    wake_word = _load_wake_word_detector(SAMPLE_RATE)
+    if wake_word:
+        log.info('Say "Ei Jarvis" or "Ei sistema" anytime to trigger the welcome sequence (no Cursor).')
+    last_wake_word_trigger = 0.0
 
     try:
         with sd.InputStream(
@@ -990,6 +990,22 @@ def main() -> int:
                     log.warning("Input overflow; try a larger BLOCK_MS")
 
                 level = rms_mono(data)
+
+                if wake_word is not None:
+                    text = wake_word.feed(data)
+                    if text:
+                        log.debug("Wake word engine heard: %r", text)
+                        words = text.split()
+                        if any(t in words for t in WAKE_WORD_TRIGGERS):
+                            now_ww = time.monotonic()
+                            if (now_ww - last_wake_word_trigger) >= WAKE_WORD_COOLDOWN_S:
+                                last_wake_word_trigger = now_ww
+                                log.info('Wake word detected (%r) — running welcome (no Cursor).', text)
+                                threading.Thread(
+                                    target=run_double_clap_actions,
+                                    kwargs={"include_cursor": False},
+                                    daemon=True,
+                                ).start()
 
                 quiet_gate = noise_floor * QUIET_GATE_MULT
                 if level < quiet_gate:
